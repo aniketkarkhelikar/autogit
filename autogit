@@ -1,0 +1,172 @@
+#!/bin/bash
+# ==============================================================
+# gitlab: Secure Git + SSH manager for shared/lab PCs
+# Author: Aniket
+# Version: Stateless + Interactive Auto-Push
+# ==============================================================
+# Usage:
+#   gitlab setup    → Create temp SSH key, configure Git, clone repo
+#   gitlab status   → Check SSH, Git, and push status
+#   gitlab cleanup  → Auto-commit/push + securely clean traces
+# ==============================================================
+
+BOLD=$(tput bold)
+RESET=$(tput sgr0)
+GREEN=$(tput setaf 2)
+RED=$(tput setaf 1)
+YELLOW=$(tput setaf 3)
+
+SSH_DIR="$HOME/.ssh"
+WORK_DIR="$HOME/dev"
+
+prompt_details() {
+  echo "${BOLD}Please enter the required details:${RESET}"
+  read -p "  GitHub Username: " GITHUB_USER
+  read -p "  Repository Name: " REPO_NAME
+  read -p "  Git Username (commit author): " GIT_USER_NAME
+  read -p "  Git Email: " GIT_USER_EMAIL
+}
+
+check_unpushed_changes() {
+  cd "$WORK_DIR" 2>/dev/null || return 0
+  for repo in $(find . -type d -name ".git" | sed 's|/.git||'); do
+    cd "$WORK_DIR/$repo" || continue
+    CHANGES=$(git status --porcelain)
+    BEHIND=$(git status -sb | grep -E '\[ahead|behind' || true)
+    if [[ -n "$CHANGES" || -n "$BEHIND" ]]; then
+      echo "$repo"
+    fi
+  done
+}
+
+auto_commit_and_push() {
+  local repo="$1"
+  cd "$WORK_DIR/$repo" || return 1
+
+  echo ""
+  echo "${YELLOW} Detected uncommitted/unpushed work in '$repo'.${RESET}"
+
+  # Show status before proceeding
+  echo ""
+  echo "${BOLD} Current Git Status:${RESET}"
+  git status
+  echo ""
+  read -p "Proceed with commit and push? (y/n): " confirm
+  [[ "$confirm" =~ ^[Yy]$ ]] || {
+    echo "${YELLOW} Skipping push for '$repo'.${RESET}"
+    return 1
+  }
+
+  # Stage all changes
+  echo ""
+  echo "Staging all changes..."
+  git add .
+  echo ""
+  echo "${GREEN} Staged files:${RESET}"
+  git status --short
+
+  # Ask for commit message
+  echo ""
+  read -p "Enter commit message (default: 'Auto save from gitlab'): " msg
+  msg=${msg:-"Auto save from gitlab"}
+
+  # Commit
+  echo ""
+  git commit -m "$msg" >/dev/null 2>&1 || {
+    echo "${YELLOW} Nothing new to commit.${RESET}"
+  }
+
+  # Identify current branch
+  current_branch=$(git rev-parse --abbrev-ref HEAD 2>/dev/null)
+  current_branch=${current_branch:-main}
+
+  # Push safely
+  echo ""
+  echo " Pushing to remote branch '${current_branch}'..."
+  git push -u origin "$current_branch" >/dev/null 2>&1
+  if [[ $? -eq 0 ]]; then
+    echo "${GREEN} Successfully pushed to origin/${current_branch}.${RESET}"
+    return 0
+  else
+    echo "${RED} Push failed! Check your SSH setup or remote branch.${RESET}"
+    return 1
+  fi
+}
+
+setup_git() {
+  prompt_details
+
+  echo "${BOLD}${GREEN} Generating a new temporary SSH key...${RESET}"
+  mkdir -p "$SSH_DIR"
+  ssh-keygen -t ed25519 -C "$GIT_USER_EMAIL" -f "$SSH_DIR/id_ed25519" -N "" >/dev/null
+
+  echo "${BOLD}${YELLOW} Starting SSH agent...${RESET}"
+  eval "$(ssh-agent -s)" >/dev/null
+  ssh-add "$SSH_DIR/id_ed25519" >/dev/null
+
+  echo ""
+  echo "${BOLD} Copy this public key and add it to GitHub:${RESET}"
+  echo "GitHub → Settings → SSH and GPG Keys → New SSH Key"
+  echo "--------------------------------------------------------------"
+  cat "$SSH_DIR/id_ed25519.pub"
+  echo "--------------------------------------------------------------"
+  read -p "Press Enter after adding the SSH key to GitHub..."
+
+  echo "${BOLD}${YELLOW} Cloning repository...${RESET}"
+  mkdir -p "$WORK_DIR" && cd "$WORK_DIR" || exit 1
+  git clone git@github.com:$GITHUB_USER/$REPO_NAME.git 2>/dev/null
+  if [[ $? -ne 0 ]]; then
+    echo "${RED} Clone failed. Check SSH key setup.${RESET}"
+    exit 1
+  fi
+
+  cd "$WORK_DIR/$REPO_NAME" || exit 1
+  git config user.name "$GIT_USER_NAME"
+  git config user.email "$GIT_USER_EMAIL"
+
+  echo ""
+  echo "${GREEN} Git setup complete!${RESET}"
+  echo "Now you can code, commit, and push using Git as normal."
+}
+
+status_git() {
+  echo "${BOLD} Checking Git + SSH status...${RESET}"
+  [ -f "$SSH_DIR/id_ed25519" ] && echo "SSH key: ${GREEN}Present${RESET}" || echo "SSH key: ${RED}Not found${RESET}"
+  [ -d "$WORK_DIR" ] && echo "Work directory: ${GREEN}Exists${RESET}" || echo "Work directory: ${RED}Not found${RESET}"
+  echo ""
+
+  echo "${BOLD} Checking if everything is pushed...${RESET}"
+  repos=$(check_unpushed_changes)
+  if [[ -z "$repos" ]]; then
+    echo "${GREEN} All work committed and pushed.${RESET}"
+  else
+    echo "${RED} Pending work in:${RESET}"
+    echo "$repos"
+  fi
+}
+
+cleanup_git() {
+  echo "${BOLD}${YELLOW}🧹 Preparing cleanup...${RESET}"
+  repos=$(check_unpushed_changes)
+  if [[ -n "$repos" ]]; then
+    for r in $repos; do
+      auto_commit_and_push "$r" || {
+        echo "${RED} Cleanup aborted — '$r' not fully pushed.${RESET}"
+        return 1
+      }
+    done
+  fi
+
+  echo ""
+  echo "${BOLD}${YELLOW}Removing SSH keys and repositories...${RESET}"
+  rm -rf "$SSH_DIR" "$WORK_DIR"
+  killall ssh-agent >/dev/null 2>&1
+  echo "${GREEN} Cleanup complete. All data and traces removed.${RESET}"
+}
+
+case "$1" in
+  setup) setup_git ;;
+  cleanup) cleanup_git ;;
+  status) status_git ;;
+  *) echo "${BOLD}Usage:${RESET} gitlab {setup|cleanup|status}" ;;
+esac
